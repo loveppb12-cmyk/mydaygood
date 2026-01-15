@@ -5,6 +5,8 @@ import json
 from datetime import datetime
 from typing import Dict, Set
 from collections import defaultdict
+import signal
+import sys
 
 from telegram import Update, ChatMember, ChatMemberAdministrator
 from telegram.ext import (
@@ -27,9 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration - Use environment variable in production
-# For now, using the token you provided (REVOKE THIS IMMEDIATELY AFTER TESTING)
-TOKEN = "8332370833:AAEbnzx1kZIIMudH4jz01GuMtqTUTm55K3I"
+# Bot configuration - Use environment variable (Heroku config var)
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8332370833:AAEbnzx1kZIIMudH4jz01GuMtqTUTm55K3I')
 
 # Rate limiting constants
 MESSAGES_PER_SECOND = 1
@@ -56,6 +57,7 @@ class TaggingSession:
 class TaggerBot:
     def __init__(self):
         self.application = None
+        self.cleanup_task = None
         
     async def is_user_admin(self, chat_id: int, user_id: int) -> bool:
         """Check if user is admin in the chat."""
@@ -138,7 +140,7 @@ class TaggerBot:
         • Avoid using too frequently
         • Monitor bot activity
         
-        **Need help?** Contact @YourSupportUsername
+        **Need help?** Contact support
         """
         
         await update.message.reply_text(help_text, parse_mode='Markdown')
@@ -488,24 +490,59 @@ class TaggerBot:
     async def cleanup_inactive_sessions(self):
         """Clean up inactive sessions periodically."""
         while True:
-            await asyncio.sleep(60)  # Check every minute
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                
+                current_time = datetime.now()
+                inactive_chats = []
+                
+                for chat_id, session in list(active_sessions.items()):
+                    # Remove sessions inactive for more than 10 minutes
+                    if (current_time - session.last_update).seconds > 600:
+                        inactive_chats.append(chat_id)
+                        
+                for chat_id in inactive_chats:
+                    if chat_id in active_sessions:
+                        session = active_sessions[chat_id]
+                        session.is_active = False
+                        if session.task and not session.task.done():
+                            session.task.cancel()
+                        del active_sessions[chat_id]
+                        
+            except Exception as e:
+                logger.error(f"Error in cleanup_inactive_sessions: {e}")
+                await asyncio.sleep(60)
+                
+    async def on_startup(self, application: Application):
+        """Run on bot startup."""
+        # Start cleanup task
+        self.cleanup_task = asyncio.create_task(self.cleanup_inactive_sessions())
+        logger.info("Cleanup task started")
+        
+    async def on_shutdown(self, application: Application):
+        """Run on bot shutdown."""
+        # Cancel all active sessions
+        for chat_id, session in list(active_sessions.items()):
+            session.is_active = False
+            if session.task and not session.task.done():
+                session.task.cancel()
+        
+        # Cancel cleanup task
+        if self.cleanup_task and not self.cleanup_task.done():
+            self.cleanup_task.cancel()
             
-            current_time = datetime.now()
-            inactive_chats = []
-            
-            for chat_id, session in list(active_sessions.items()):
-                # Remove sessions inactive for more than 10 minutes
-                if (current_time - session.last_update).seconds > 600:
-                    inactive_chats.append(chat_id)
-                    
-            for chat_id in inactive_chats:
-                if chat_id in active_sessions:
-                    del active_sessions[chat_id]
-                    
+        logger.info("Bot shutdown completed")
+        
     def run(self):
         """Start the bot."""
-        # Create Application
-        self.application = Application.builder().token(TOKEN).build()
+        # Create Application with persistence
+        self.application = (
+            Application.builder()
+            .token(TOKEN)
+            .post_init(self.on_startup)
+            .post_shutdown(self.on_shutdown)
+            .build()
+        )
         
         # Add command handlers
         self.application.add_handler(CommandHandler("start", self.start_command))
@@ -515,11 +552,19 @@ class TaggerBot:
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("stats", self.stats_command))
         
-        # Start cleanup task
-        asyncio.create_task(self.cleanup_inactive_sessions())
-        
         # Start the bot
         logger.info("Starting Universal Tagging Bot...")
+        
+        # Security check
+        if TOKEN == "8332370833:AAEbnzx1kZIIMudH4jz01GuMtqTUTm55K3I":
+            print("=" * 60)
+            print("⚠️  SECURITY WARNING!")
+            print("=" * 60)
+            print("You are using a publicly shared bot token.")
+            print("For production, set TELEGRAM_BOT_TOKEN environment variable.")
+            print("=" * 60)
+            print("")
+        
         print("Bot is running! Add it to your groups.")
         print("Bot commands:")
         print("/start - Welcome message")
@@ -529,24 +574,32 @@ class TaggerBot:
         print("/status - Check status")
         print("/stats - Group statistics")
         
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Run the bot until Ctrl+C is pressed
+        self.application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
 
 def main():
     """Main function to run the bot."""
-    # Security warning
-    print("=" * 60)
-    print("⚠️  SECURITY WARNING!")
-    print("=" * 60)
-    print("You have publicly shared your bot token.")
-    print("This token should be kept SECRET!")
-    print("")
-    print("Immediately revoke this token in @BotFather")
-    print("and use environment variables for production.")
-    print("=" * 60)
-    print("")
+    # Handle graceful shutdown
+    def signal_handler(signum, frame):
+        print("\nShutting down bot...")
+        sys.exit(0)
+        
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
+    # Run bot
     bot = TaggerBot()
-    bot.run()
+    
+    try:
+        bot.run()
+    except KeyboardInterrupt:
+        print("\nBot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
